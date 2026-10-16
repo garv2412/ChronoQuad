@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quadruped_pympc"
+version = "1.0.0"
+
+[tool.pixi.workspace]
+name = "quadruped_pympc_env"
+channels = ["conda-forge", "nvidia"]
+platforms = ["linux-64"]
+requires-pixi = ">=0.63.0"
+
+[tool.pixi.dependencies]
+pip = "*"
+python = "*"
+casadi = "*"
+numpy = "*"
+matplotlib = "*"
+meshcat-python = "*"
+scipy = "*"
+pinocchio = "*"
+compilers = "*"
+cmake = "*"
+pkg-config = "*"
+make = "*"
+ninja = "*"
+colcon-common-extensions = "*"
+tqdm = "*"
+gymnasium = "*"
+
+[tool.pixi.pypi-dependencies]
+quadruped_pympc = { path = ".", editable = true }
+adam-robotics = { version = "*", extras = ["all"] }
+mujoco = "*"
+readchar = "*"
+liecasadi = "*"
+gym-quadruped = "*"
+
+# jax comes from PyPI: the wheels bundle their own protobuf, so they don't clash
+# with the libprotobuf pinned by robostack (conda-forge jaxlib lags behind it)
+[tool.pixi.feature.no-cuda.pypi-dependencies]
+jax = "*"
+
+[tool.pixi.feature.cuda.system-requirements]
+cuda = "12"
+
+[tool.pixi.feature.cuda.pypi-dependencies]
+jax = { version = "*", extras = ["cuda12"] }
+
+[tool.pixi.feature.common.activation.env]
+ROS_LOCALHOST_ONLY = "1"
+
+[tool.pixi.feature.lyrical]
+channels = ["https://prefix.dev/robostack-lyrical"]
+
+[tool.pixi.feature.lyrical.dependencies]
+ros-lyrical-desktop = "*"
+ros-lyrical-rmw-cyclonedds-cpp = "*"
+ros-lyrical-rosidl-generator-dds-idl = "*"
+ros-lyrical-plotjuggler-ros = "*"
+
+[tool.pixi.feature.humble]
+channels = ["https://prefix.dev/robostack-humble"]
+
+[tool.pixi.feature.humble.dependencies]
+ros-humble-desktop = "*"
+ros-humble-rmw-cyclonedds-cpp = "*"
+ros-humble-rosidl-generator-dds-idl = "*"
+ros-humble-plotjuggler-ros = "*"
+
+[tool.pixi.environments]
+default = ["common", "no-cuda", "humble"]
+lyrical-no-cuda = ["common", "no-cuda", "lyrical"]
+lyrical-cuda = ["common", "cuda", "lyrical"]
+humble-no-cuda = ["common", "no-cuda", "humble"]
+humble-cuda = ["common", "cuda", "humble"]

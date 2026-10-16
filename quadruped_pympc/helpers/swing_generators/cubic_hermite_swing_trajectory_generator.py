@@ -1,0 +1,249 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+from quadruped_pympc import config as cfg
+
+
+class SwingTrajectoryGenerator:
+    """Generate a Cartesian swing using two cubic Hermite polynomials.
+
+    Each segment occupies half of the swing: lift-off to apex, then apex to
+    touchdown. The segments share position and velocity at the apex (C1
+    continuity). All positions must use the same coordinate frame, with z
+    pointing upward; distances are in metres and times are in seconds.
+
+    If an early contact is detected (reflex), the swing is replanned from the
+    hit point over the remaining swing time, with a higher apex.
+    """
+
+    def __init__(self, step_height: float, swing_period: float) -> None:
+        """Set the step height and the total swing duration.
+
+        step_height is the apex height above the highest between lift-off
+        and touchdown, as in the other swing generators.
+        """
+        # A positive duration is required to normalize time and compute derivatives.
+        if not np.isfinite(swing_period) or swing_period <= 0:
+            raise ValueError("swing_period must be finite and positive")
+        self.step_height = step_height
+        self.swing_period = swing_period
+        self.half_swing_period = swing_period / 2
+
+        # Reflexes: set by the early stance detector for the steps after an early contact
+        self.reflex_next_steps_height_enhancement = False
+        self.reflex_max_step_height = cfg.simulation_params['reflex_max_step_height']
+
+        # When blind, the obstacle that caused the early contact is higher than
+        # expected, so the reflex touchdown is placed above the planned foothold
+        self.blind_locomotion = cfg.simulation_params['visual_foothold_adaptation'] == 'blind'
+
+    def plot_trajectory_3d(self, curve_points: np.ndarray) -> None:
+        """Display sampled Cartesian positions supplied as an (N, 3) array."""
+        curve_points = np.array(curve_points)
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+        ax.plot(curve_points[:, 0], curve_points[:, 1], curve_points[:, 2])
+        ax.legend()
+
+        plt.title("3D cubic swing")
+        plt.show()
+
+    def plot_trajectory_references(self, tp, fp, vp, ap):
+        """Plot N timestamps and their (N, 3) position/velocity/acceleration arrays."""
+        # Convert lists to NumPy arrays for easier plotting
+        time_points = np.array(tp)
+        footPosDes_points = np.array(fp)
+        footVelDes_points = np.array(vp)
+        footAccDes_points = np.array(ap)
+
+        # Create subplots for position, velocity, and acceleration
+        fig, axs = plt.subplots(3, 1, figsize=(8, 12))
+
+        # Plot position
+        for i in range(3):
+            axs[0].plot(time_points, footPosDes_points[:, i], label=f"Position {i + 1}")
+        axs[0].set_xlabel('Time')
+        axs[0].set_ylabel('Position')
+        axs[0].legend()
+
+        # Plot velocity
+        for i in range(3):
+            axs[1].plot(time_points, footVelDes_points[:, i], label=f"Velocity {i + 1}")
+        axs[1].set_xlabel('Time')
+        axs[1].set_ylabel('Velocity')
+        axs[1].legend()
+
+        # Plot acceleration
+        for i in range(3):
+            axs[2].plot(time_points, footAccDes_points[:, i], label=f"Acceleration {i + 1}")
+        axs[2].set_xlabel('Time')
+        axs[2].set_ylabel('Acceleration')
+        axs[2].legend()
+
+        plt.tight_layout()
+        plt.show()
+
+    def compute_control_points(
+        self, swing_time: float, lift_off: np.ndarray, touch_down: np.ndarray,
+        early_stance_hitmoment=-1, early_stance_hitpoint=None,
+    ) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return the Hermite boundary data for the active half of the swing.
+
+        swing_time is elapsed time since lift-off. Endpoint inputs may be flat,
+        row or column vectors containing three Cartesian coordinates.
+        Returns (local_time, segment_duration, start_position, end_position,
+        start_velocity, end_velocity), with velocities expressed in metres per second.
+        These are Hermite boundary conditions, not Bezier control points.
+        """
+        # Normalize input shapes so every vector operation produces a (3,) array.
+        start = np.asarray(lift_off, dtype=float).reshape(3)
+        end = np.asarray(touch_down, dtype=float).reshape(3)
+        start_time = 0.0
+        reflex = False
+        if self.reflex_next_steps_height_enhancement:
+            height = self.reflex_max_step_height
+        else:
+            height = self.step_height
+
+        if early_stance_hitpoint is not None and early_stance_hitmoment != -1:
+            # Reflex: restart from the hit point, over the remaining swing time.
+            # As in the scipy generator, the new touchdown is a bit before the planned
+            # one and, when blind, raised since the obstacle is higher than expected.
+            hitpoint = np.asarray(early_stance_hitpoint, dtype=float).reshape(3)
+            reflex_apex_z = 0.5 * (hitpoint[2] + end[2]) + self.reflex_max_step_height
+            end = 0.2 * hitpoint + 0.8 * end
+            if self.blind_locomotion:
+                end[2] = np.asarray(touch_down, dtype=float).reshape(3)[2] + self.reflex_max_step_height / 2.0
+            start = hitpoint
+            start_time = float(np.clip(early_stance_hitmoment, 0.0, self.swing_period))
+            reflex = True
+
+        duration = self.swing_period - start_time
+        half_duration = duration / 2
+        if half_duration <= 0.0:
+            # Hit exactly at touchdown time: hold the end position.
+            return 0.0, 1.0, end, end, np.zeros(3), np.zeros(3)
+
+        # Place the apex halfway along the horizontal displacement, in the middle of the
+        # (remaining) swing, at step height above the highest of the two endpoints.
+        # For the reflex, as in the scipy generator, the apex is above the midpoint between
+        # hit point and planned touchdown (the raised blind touchdown would otherwise push
+        # it out of the leg workspace).
+        apex = 0.5 * (start + end)
+        if not reflex:
+            apex[2] = max(start[2], end[2]) + height
+        else:
+            apex[2] = reflex_apex_z
+        # The horizontal cubic p(s) = p_start + (3*s**2 - 2*s**3)*(p_end-p_start),
+        # s = t/duration, has zero endpoint velocities and midpoint velocity
+        # 1.5*delta/duration.
+        # Reusing that velocity in both halves reproduces this cubic in x and y,
+        # so horizontal acceleration is continuous as well as velocity.
+        apex_velocity = 1.5 * (end - start) / duration
+        # Only vertical motion stops at the apex; horizontal motion can continue.
+        apex_velocity[2] = 0.0
+        # Clamp evaluation to the endpoints instead of extrapolating the cubics.
+        local_time = float(np.clip(swing_time, start_time, self.swing_period)) - start_time
+
+        # Both segments use exactly the same apex position and velocity.
+        # At the knot itself, select the first segment (left-hand acceleration).
+        if local_time <= half_duration:
+            return local_time, half_duration, start, apex, np.zeros(3), apex_velocity
+        # Reset the local clock for the descending segment, without wrapping the touchdown time.
+        return local_time - half_duration, half_duration, apex, end, apex_velocity, np.zeros(3)
+
+    def compute_trajectory_references(
+        self, swing_time: float, lift_off: np.ndarray, touch_down: np.ndarray,
+        early_stance_hitmoment=-1, early_stance_hitpoint=None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Evaluate two C1 cubic Hermite segments and their time derivatives.
+
+        Velocity is zero at lift-off and touchdown, and its z component is
+        zero at the apex. Vertical acceleration may jump at the apex when
+        endpoint heights differ. If early_stance_hitpoint is given, the swing
+        is replanned from the hit point (reflex).
+        Times outside the swing interval hold the corresponding endpoint.
+
+        Returns three (3,) arrays: position [m], velocity [m/s], and
+        acceleration [m/s^2], all expressed in the input coordinate frame.
+        """
+        # Shift time to the beginning of the active segment: tau = t - t_s.
+        # T is the SEGMENT duration, not the total swing period.
+        tau, T, q_s, q_f, q_dot_s, q_dot_f = self.compute_control_points(
+            swing_time, lift_off, touch_down, early_stance_hitmoment, early_stance_hitpoint
+        )
+
+        # Solve the four endpoint constraints componentwise in x, y and z:
+        # q(0) = q_s, q(T) = q_f, q_dot(0) = q_dot_s, q_dot(T) = q_dot_f.
+        # These are the closed-form coefficients in Eqs. (23)-(26) of the
+        # shifted-time reference, for q(tau) = a0 + a1*tau + a2*tau^2 + a3*tau^3.
+        a0 = q_s
+        a1 = q_dot_s
+        a2 = 3 * (q_f - q_s) / T**2 - (2 * q_dot_s + q_dot_f) / T
+        a3 = -2 * (q_f - q_s) / T**3 + (q_dot_s + q_dot_f) / T**2
+
+        # Evaluate position and its analytical time derivatives, Eqs. (13)-(15).
+        # Since tau is measured in seconds and d(tau)/dt = 1, no additional
+        # derivative scaling is needed. Outputs have units m, m/s and m/s^2.
+        position = a0 + a1 * tau + a2 * tau**2 + a3 * tau**3
+        velocity = a1 + 2 * a2 * tau + 3 * a3 * tau**2
+        acceleration = 2 * a2 + 6 * a3 * tau
+
+        # C1 continuity does not require matching vertical acceleration at the
+        # apex: with equal half durations, it matches only for equal endpoint z.
+        # Outside the swing, the clamped position is held stationary. At exactly
+        # lift-off or touchdown, retain the cubic's one-sided acceleration.
+        if swing_time < 0.0 or swing_time > self.swing_period:
+            velocity = np.zeros(3)
+            acceleration = np.zeros(3)
+        return position, velocity, acceleration
+
+
+if __name__ == "__main__":
+    # Example swing: distances are in metres and times are in seconds.
+    # Change these parameters to inspect a different step or landing position.
+    step_height = 0.08
+    swing_period = 0.9
+    simulation_dt = 0.002
+    lift_off = np.array([0.0, 0.0, 0.0])
+    touch_down = np.array([0.1, -0.2, 0.0])
+    trajectory_generator = SwingTrajectoryGenerator(step_height=step_height, swing_period=swing_period)
+
+    # Include both lift-off (t = 0) and touchdown (t = swing_period).
+    # Use the same timestamps for evaluation and plotting to avoid a sample delay.
+    num_intervals = int(np.ceil(swing_period / simulation_dt))
+    time_points = np.linspace(0.0, swing_period, num_intervals + 1)
+    references = np.array([
+        trajectory_generator.compute_trajectory_references(
+            swing_time=foot_swing_time, lift_off=lift_off, touch_down=touch_down
+        )
+        for foot_swing_time in time_points
+    ])
+    # Shape: (time samples, reference kind [position, velocity, acceleration], xyz).
+    position_points = references[:, 0, :]
+
+    # Keep the spatial curve and all time references in one window.
+    fig = plt.figure(figsize=(13, 8), constrained_layout=True)
+    grid = fig.add_gridspec(3, 2)
+    ax_3d = fig.add_subplot(grid[:, 0], projection="3d")
+    ax_3d.plot(*position_points.T, label="Swing trajectory")
+    ax_3d.scatter(*lift_off, color="tab:green", label="Lift-off")
+    ax_3d.scatter(*touch_down, color="tab:red", label="Touchdown")
+    ax_3d.set(xlabel="x [m]", ylabel="y [m]", zlabel="z [m]", title="Foot trajectory")
+    ax_3d.legend()
+
+    # Plot Cartesian components with consistent colours across the three panels.
+    time_axes = []
+    for reference_index, ylabel in enumerate(("Position [m]", "Velocity [m/s]", "Acceleration [m/s²]")):
+        ax = fig.add_subplot(grid[reference_index, 1], sharex=time_axes[0] if time_axes else None)
+        for component, label in enumerate(("x", "y", "z")):
+            ax.plot(time_points, references[:, reference_index, component], label=label)
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(0.0, swing_period)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best")
+        time_axes.append(ax)
+    time_axes[-1].set_xlabel("Time [s]")
+    fig.suptitle(f"Cubic Hermite swing — duration {swing_period:g} s, step height {step_height:g} m")
+    plt.show()

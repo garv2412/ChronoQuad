@@ -1,0 +1,35 @@
+FROM mcr.microsoft.com/devcontainers/python:1-3.11-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+
+# Remove broken yarn repo and install OpenGL, X11, and build dependencies
+RUN rm -f /etc/apt/sources.list.d/yarn.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    libgl1 \
+    libglx-mesa0 \
+    libgl1-mesa-dri \
+    libxext6 \
+    libsm6 \
+    libxrender1 \
+    libxrandr2 \
+    libxinerama1 \
+    libxcursor1 \
+    libxi6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install python utilities
+RUN pip install --default-timeout=1000 --retries=10 tqdm readchar liecasadi adam-robotics
+
+# Install MuJoCo and CasADi
+RUN pip install --default-timeout=1000 --retries=10 casadi mujoco
+
+# Install Gym Quadruped
+RUN pip install --default-timeout=1000 --retries=10 gym-quadruped
+
+# Install JAX with CUDA 12
+RUN pip install --default-timeout=1000 --retries=10 "jax[cuda12]"
+
+WORKDIR /workspace
